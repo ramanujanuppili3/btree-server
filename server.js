@@ -98,6 +98,107 @@ app.put('/api/btree/node/:nodeId/update', async (req, res) => {
   }
 });
 
+// ✅ POST: Insert an intermediary node between an existing parent and child
+app.post('/api/btree/node/create', async (req, res) => {
+  const session = driver.session();
+
+  try {
+    const {
+      parentId,
+      childId,
+      intermediaryId,
+      value,
+      index
+    } = req.body;
+
+    if (!parentId || !childId) {
+      return res.status(400).json({
+        error: 'parentId and childId are required'
+      });
+    }
+
+    const middleId = intermediaryId || `node_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    const middleValue = value !== undefined ? value : null;
+    const middleIndex = index !== undefined ? index : null;
+
+    // Find the existing relationship type between parent and child
+    const relResult = await session.run(
+      `
+        MATCH (parent:TreeNode {id: $parentId})-[rel]->(child:TreeNode {id: $childId})
+        RETURN type(rel) AS relType
+      `,
+      { parentId, childId }
+    );
+
+    if (relResult.records.length === 0) {
+      return res.status(404).json({
+        error: 'No parent-child relationship found'
+      });
+    }
+
+    const relType = relResult.records[0].get('relType');
+
+    // Only allow tree-style relationship types
+    if (!['LEFT', 'RIGHT', 'PARENT_OF'].includes(relType)) {
+      return res.status(400).json({
+        error: `Unsupported relationship type: ${relType}`
+      });
+    }
+
+    const query = `
+      MATCH (parent:TreeNode {id: $parentId})-[oldRel]->(child:TreeNode {id: $childId})
+      CREATE (middle:TreeNode {
+        id: $middleId,
+        value: $middleValue,
+        index: $middleIndex
+      })
+      DELETE oldRel
+      CREATE (parent)-[:${relType}]->(middle)
+      CREATE (middle)-[:${relType}]->(child)
+      RETURN middle
+    `;
+
+
+    console.log(`🔗 Inserting intermediary node between parent '${parentId}' and child '${childId}'   middleId: ${middleId},
+      middleValue: ${middleValue},
+      middleIndex: ${middleIndex}`);
+
+    const result = await session.run(query, {
+      parentId,
+      childId,
+      middleId,
+      middleValue,
+      middleIndex
+    });
+
+    if (result.records.length === 0) {
+      return res.status(404).json({
+        error: 'Unable to insert intermediate node'
+      });
+    }
+
+    const newNode = result.records[0].get('middle');
+
+    return res.status(201).json({
+      success: true,
+      insertedNode: {
+        id: newNode.properties.id,
+        value: newNode.properties.value,
+        index: newNode.properties.index
+      },
+      parentId,
+      childId,
+      relationshipType: relType
+    });
+
+  } catch (err) {
+    console.error('❌ Error inserting intermediary node:', err);
+    return res.status(500).json({ error: err.message });
+  } finally {
+    await session.close();
+  }
+});
+
 // Fetch B-tree node
 app.get('/api/btree/node/:nodeId', async (req, res) => {
   const session = driver.session();
@@ -158,42 +259,96 @@ app.get('/api/btree/tree', async (req, res) => {
 
 app.get('/api/btree/nested', async (req, res) => {
   const session = driver.session();
-  
-  try {
-    const result = await session.run(`
-      MATCH (root:TreeNode {id: 'node_48'})
-      OPTIONAL MATCH (root)-[:LEFT]->(left:TreeNode)
-      OPTIONAL MATCH (root)-[:RIGHT]->(right:TreeNode)
-      OPTIONAL MATCH (left)-[:LEFT]->(leftLeft:TreeNode)
-      OPTIONAL MATCH (left)-[:RIGHT]->(leftRight:TreeNode)
-      OPTIONAL MATCH (right)-[:LEFT]->(rightLeft:TreeNode)
-      OPTIONAL MATCH (right)-[:RIGHT]->(rightRight:TreeNode)
-      RETURN {
-        value: root.value,
-        nodeId: root.id,
-        index: root.index,
-        left: CASE WHEN left IS NOT NULL THEN {
-          value: left.value,
-          nodeId: left.id,
-          index: left.index,
-          left: CASE WHEN leftLeft IS NOT NULL THEN {value: leftLeft.value, index: leftLeft.index} END,
-          right: CASE WHEN leftRight IS NOT NULL THEN {value: leftRight.value, index: leftRight.index} END
-        } END,
-        right: CASE WHEN right IS NOT NULL THEN {
-          value: right.value,
-          nodeId: right.id,
-          index: right.index,
-          left: CASE WHEN rightLeft IS NOT NULL THEN {value: rightLeft.value, index: rightLeft.index} END,
-          right: CASE WHEN rightRight IS NOT NULL THEN {value: rightRight.value, index: rightRight.index} END
-        } END
-      } as tree
-    `);
 
-    if (result.records.length > 0) {
-      res.json(result.records[0].get('tree'));
+  try {
+    const rootId = req.query.rootId || 'node_48';
+
+    const result = await session.run(
+      `
+      MATCH (root:TreeNode {id: $rootId})
+      OPTIONAL MATCH (root)-[:LEFT|RIGHT*0..]->(node:TreeNode)
+      WITH collect(DISTINCT node) AS nodes
+
+      UNWIND nodes AS parent
+      OPTIONAL MATCH (parent)-[relationship:LEFT|RIGHT]->(child:TreeNode)
+
+      RETURN nodes,
+             collect({
+               parentId: parent.id,
+               relationshipType: type(relationship),
+               child: child
+             }) AS edges
+      `,
+      { rootId }
+    );
+
+    if (result.records.length === 0) {
+      return res.status(404).json({
+        error: `Root node '${rootId}' not found`
+      });
     }
+
+    const record = result.records[0];
+    const nodes = record.get('nodes');
+    const edges = record.get('edges');
+
+    const nodeMap = new Map();
+
+    nodes
+      .filter(node => node !== null)
+      .forEach(node => {
+        nodeMap.set(node.properties.id, {
+          value: node.properties.value,
+          nodeId: node.properties.id,
+          index: node.properties.index,
+          left: null,
+          right: null
+        });
+      });
+
+    edges
+      .filter(edge => edge.child !== null)
+      .forEach(edge => {
+        const parent = nodeMap.get(edge.parentId);
+        const child = nodeMap.get(edge.child.properties.id);
+
+        if (!parent || !child) {
+          return;
+        }
+
+        if (edge.relationshipType === 'LEFT') {
+          parent.left = child;
+        }
+
+        if (edge.relationshipType === 'RIGHT') {
+          parent.right = child;
+        }
+
+        // Supports trees that use PARENT_OF relationships.
+        if (edge.relationshipType === 'PARENT_OF') {
+          if (!parent.left) {
+            parent.left = child;
+          } else if (!parent.right) {
+            parent.right = child;
+          }
+        }
+      });
+
+    const tree = nodeMap.get(rootId);
+
+    if (!tree) {
+      return res.status(404).json({
+        error: `Root node '${rootId}' not found`
+      });
+    }
+
+    return res.json(tree);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('Error fetching nested tree:', error);
+
+    return res.status(500).json({
+      error: error.message
+    });
   } finally {
     await session.close();
   }
